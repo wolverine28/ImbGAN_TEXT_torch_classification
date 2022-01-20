@@ -29,43 +29,29 @@ from latent_mapping import latent_mapping
 
 from GAN_training_fun import train_GAN_SUB
 
-# ================== utils =================
-def compute_BA(preds, labels):
+def run(IR,rep,GPU_NUM,OR):
 
-    TP = torch.logical_and(preds==1,labels==1).sum()
-    FP = torch.logical_and(preds==1,labels==0).sum()
-    TN = torch.logical_and(preds==0,labels==0).sum()
-    FN = torch.logical_and(preds==0,labels==1).sum()
-
-    TPR = TP/(TP+FN)
-    TNR = TN/(TN+FP)
-
-    # if target.sum()!=0:
-
-    BA = (TPR+TNR)/2
-    return BA
-
-def run(IR,rep,GPU_NUM,OR,Method):
-
-    output_file = '{:s}/rep_{:02d}_IR_{:.4f}_{:s}_AGNews.csv'.format('./output',rep,IR,Method)
-    print(output_file)
+    output_file = '{:s}/rep_{:02d}_IR_{:.4f}_ImbGANSUB_AGNews.csv'.format('./output',rep,IR)
     if os.path.exists(output_file):
-        return 0
-    
-    if Method not in ['Original', 'ROS', 'GAN', 'ImbGAN']:
         return 0
 
     #########################################################################################
     device = torch.device(f'cuda:{GPU_NUM}' if torch.cuda.is_available() else 'cpu')
     torch.cuda.set_device(device) # change allocation of current GPU
     print ('Current cuda device ', torch.cuda.current_device()) # check
+
+    # Additional Infos
+    if device.type == 'cuda':
+        print(torch.cuda.get_device_name(GPU_NUM))
+        print('Memory Usage:')
+        print('Allocated:', round(torch.cuda.memory_allocated(GPU_NUM)/1024**3,1), 'GB')
+        print('Cached:   ', round(torch.cuda.memory_cached(GPU_NUM)/1024**3,1), 'GB')
     #########################################################################################
 
     # ================== Parameter Definition =================
     USE_CUDA = True
     BATCH_SIZE = 128
     SEQ_LEN = 100
-    GENERATED_NUM = 10000
 
     emb_dim = 200
     hidden_dim = 100
@@ -131,7 +117,6 @@ def run(IR,rep,GPU_NUM,OR,Method):
     ori_label = test_dataset[:,0].astype(np.int)
     bin_label = (ori_label>=3)*1
     test_dataset = MyDataset_origin(test_dataset[:,1],bin_label,ori_label)
-
     # ================== Dataloader Definition =================
     if OR:
         train_dataset = get_overlapped_datset(train_dataset,3)
@@ -140,10 +125,9 @@ def run(IR,rep,GPU_NUM,OR,Method):
         train_dataset = get_datset(train_dataset)
         test_dataset = get_datset(test_dataset)
 
-    if Method!='ROS':
-        train_loader, test_loader = get_imbalanced_loader(train_dataset,test_dataset,BATCH_SIZE,SEQ_LEN+1,vocab)
-    else:
-        train_loader, test_loader = get_oversampled_loader(train_dataset,test_dataset,BATCH_SIZE,SEQ_LEN,vocab)
+
+    train_loader, test_loader = get_imbalanced_loader(train_dataset,test_dataset,BATCH_SIZE,SEQ_LEN+1,vocab)
+    # train_loader, test_loader = get_oversampled_loader(train_dataset,test_dataset,BATCH_SIZE,SEQ_LEN,vocab)
 
     # batch = next(iter(train_loader))
     # print([TEXT.vocab.itos[i] for i in batch[0][0]])
@@ -154,68 +138,86 @@ def run(IR,rep,GPU_NUM,OR,Method):
     if USE_CUDA:
         classifier = classifier.cuda()
         criterion = criterion.cuda()
+
+    # Define Networks
+    generator = Generator(VOCAB_SIZE, g_emb_dim, g_hidden_dim, use_cuda)
+    generator.load_state_dict(torch.load('./log/gen_10_0070.t7').state_dict())
+
+    netSubD = Discriminator(d_num_class, VOCAB_SIZE, d_emb_dim, d_filter_sizes, d_num_filters, d_dropout)
+    netM = latent_mapping(g_hidden_dim)
+    if use_cuda:
+        generator = generator.cuda()
+        netSubD = netSubD.cuda()
+        netM = netM.cuda()
+
+    # ================== Optimizer Definition =================
     optimizer = optim.Adam(classifier.parameters(),lr=1e-4)
-
-    if Method=='ImbGAN' or Method=='GAN':
-        generator = Generator(VOCAB_SIZE, g_emb_dim, g_hidden_dim, use_cuda)
-        generator.load_state_dict(torch.load('./log/gen_10_0070.t7').state_dict())
-        if use_cuda:
-            generator = generator.cuda()
-
-    if Method=='ImbGAN':
-        netSubD = Discriminator(d_num_class, VOCAB_SIZE, d_emb_dim, d_filter_sizes, d_num_filters, d_dropout)
-        netM = latent_mapping(g_hidden_dim)
-        if use_cuda:
-            netSubD = netSubD.cuda()
-            netM = netM.cuda()
-        optimizerSubD = optim.Adam(netSubD.parameters(),lr=1e-4)
-        optimizerM = optim.Adam(netM.parameters(),lr=1e-4)
-
+    optimizerSubD = optim.Adam(netSubD.parameters(),lr=1e-4)
+    optimizerM = optim.Adam(netM.parameters(),lr=1e-4)
     # ================== Oversampling Set  =================
-    if Method=='GAN' or Method=='ImbGAN':
-        def generate_samples(model,h, batch_size, generated_num, SOS):
-            samples = []
-            for _ in range(int(generated_num / batch_size)):
-                sample = model.sample(h, batch_size, SEQ_LEN, SOS).cpu().data.numpy().tolist()
-                samples.extend(sample)
-            return np.array(samples)
-        h = torch.randn((1, BATCH_SIZE, g_hidden_dim))
-        m_prime = torch.tensor(generate_samples(generator,h, BATCH_SIZE, GENERATED_NUM, SOS))
-        m_prime_miss = torch.tensor(generate_samples(generator,h, BATCH_SIZE, GENERATED_NUM, SOS))
-        train_dataset_processed = collate_batch(train_dataset, SEQ_LEN+1, vocab)
-        m_miss = train_dataset_processed[1][train_dataset_processed[0]==1].cuda()
-        m_miss = m_miss[:,1:]
+    def generate_samples(model,h, batch_size, generated_num, SOS):
+        samples = []
+        for _ in range(int(generated_num / batch_size)):
+            sample = model.sample(h, batch_size, SEQ_LEN, SOS).cpu().data.numpy().tolist()
+            samples.extend(sample)
+        return np.array(samples)
+
+    GENERATED_NUM = 10000
+    h = torch.randn((1, BATCH_SIZE, g_hidden_dim))
+    m_prime = torch.tensor(generate_samples(generator,h, BATCH_SIZE, GENERATED_NUM, SOS))
+    m_prime_miss = torch.tensor(generate_samples(generator,h, BATCH_SIZE, GENERATED_NUM, SOS))
+    train_dataset_processed = collate_batch(train_dataset, SEQ_LEN+1, vocab)
+    m_miss = train_dataset_processed[1][train_dataset_processed[0]==1].cuda()
+    m_miss = m_miss[:,1:]
 
     # print(' '.join([vocab.itos[i] for i in generator.sample(1, SEQ_LEN, SOS)[0]]))
+    # ================== utils =================
+    def accuracy(preds, y):
+        preds = (torch.sigmoid(preds.data)>0.5).view(-1)
+        acc = torch.sum(preds == y) / len(y)
+        return acc
+
+    def compute_BA(preds, labels):
+
+        TP = torch.logical_and(preds==1,labels==1).sum()
+        FP = torch.logical_and(preds==1,labels==0).sum()
+        TN = torch.logical_and(preds==0,labels==0).sum()
+        FN = torch.logical_and(preds==0,labels==1).sum()
+
+        TPR = TP/(TP+FN)
+        TNR = TN/(TN+FP)
+
+        # if target.sum()!=0:
+
+        BA = (TPR+TNR)/2
+        return BA
+
     # ================== Training Loop =================
     N_EPOCH = 50
     beta = 0.5
     for i in range(N_EPOCH):
         classifier.train()
-        train_acc, train_loss  = [], []
+        train_len, train_acc, train_loss  = 0, [], []
         all_miss = []
         for batch_no, batch in enumerate(tqdm(train_loader,total=int(len(train_loader)/BATCH_SIZE))):
+            
             target = batch[0]
             data = batch[1]
             if USE_CUDA:
                 data, target = data.cuda(), target.float().cuda()
 
-            if (Method=='GAN' or Method=='ImbGAN') and i>25:
-                ## Prepare training set
-                ID = int(((target==0).sum()-(target==1).sum()).item()*1)
-                if ID<=0:
-                    ID=0
-                ID_origin = int(ID*(1-beta))
-                ID_overlap = ID-ID_origin
-                t_m_prime = m_prime[np.random.choice(range(m_prime.shape[0]),ID_origin)]
-                t_m_prime_miss = m_prime_miss[np.random.choice(range(m_prime_miss.shape[0]),ID_overlap)]
-                syn_data = torch.cat((t_m_prime,t_m_prime_miss))
+            ## Prepare training set
+            ID = int(((target==0).sum()-(target==1).sum()).item()*1)
+            if ID<=0:
+                ID=0
+            ID_origin = int(ID*(1-beta))
+            ID_overlap = ID-ID_origin
+            t_m_prime = m_prime[np.random.choice(range(m_prime.shape[0]),ID_origin)]
+            t_m_prime_miss = m_prime_miss[np.random.choice(range(m_prime_miss.shape[0]),ID_overlap)]
+            syn_data = torch.cat((t_m_prime,t_m_prime_miss))
 
-                all_data = torch.cat((data[:,1:],syn_data.cuda()))
-                all_target = torch.cat((target,torch.ones(syn_data.shape[0]).cuda()))
-            else:
-                all_data = data[:,1:]
-                all_target = target
+            all_data = torch.cat((data[:,1:],syn_data.cuda()))
+            all_target = torch.cat((target,torch.ones(syn_data.shape[0]).cuda()))
 
             ## Update Classifier
             optimizer.zero_grad()
@@ -233,14 +235,14 @@ def run(IR,rep,GPU_NUM,OR,Method):
             ## Update miss set
             all_miss.append(all_data[torch.logical_and(all_target==1,predicted==False)])
 
-        if Method=='ImbGAN':
-            batch_miss = torch.cat(all_miss)
-            alpha = (1+np.cos((i)/N_EPOCH*np.pi))*0.5
-            # l = np.random.choice(range(batch_miss.shape[0]),int(np.ceil(batch_miss.shape[0]*alpha)), replace=False)
-            m_count = min(int(np.ceil(m_miss.shape[0]*alpha)),int(np.ceil(batch_miss.shape[0]*alpha)))
-            l = np.random.choice(range(batch_miss.shape[0]),m_count, replace=False)
-            idx = np.random.choice(range(m_miss.shape[0]),len(l), replace=False)
-            m_miss[idx] = batch_miss[l]    
+
+        batch_miss = torch.cat(all_miss)
+        alpha = (1+np.cos((i)/N_EPOCH*np.pi))*0.5
+        # l = np.random.choice(range(batch_miss.shape[0]),int(np.ceil(batch_miss.shape[0]*alpha)), replace=False)
+        m_count = min(int(np.ceil(m_miss.shape[0]*alpha)),int(np.ceil(batch_miss.shape[0]*alpha)))
+        l = np.random.choice(range(batch_miss.shape[0]),m_count, replace=False)
+        idx = np.random.choice(range(m_miss.shape[0]),len(l), replace=False)
+        m_miss[idx] = batch_miss[l]    
 
         train_epoch_loss = np.mean( train_loss )
         train_epoch_acc = np.mean( train_acc )
@@ -274,20 +276,19 @@ def run(IR,rep,GPU_NUM,OR,Method):
                     np.mean(test_loss), acc))
 
         ## Update Generator
-        if Method=='ImbGAN':
-            if i > 25:
-                if i%5==4:
-                    m_miss_dataset = MyDataset(m_miss,torch.ones(m_miss.shape[0]))
-                    m_miss_dataloader = torch.utils.data.DataLoader(m_miss_dataset, batch_size=128,
-                                                        shuffle=True, num_workers=int(0))
-                    print('Training GAN model')
+        if i > 25:
+            if i%5==4:
+                m_miss_dataset = MyDataset(m_miss,torch.ones(m_miss.shape[0]))
+                m_miss_dataloader = torch.utils.data.DataLoader(m_miss_dataset, batch_size=128,
+                                                    shuffle=True, num_workers=int(0))
+                print('Training GAN model')
 
-                    train_GAN_SUB(g_hidden_dim, generator, netM, optimizerM, netSubD, optimizerSubD,m_miss_dataloader, SOS, 10, BATCH_SIZE, SEQ_LEN, vocab, use_cuda=True)
-                    # train_WGANGP(128,netG,netD,25, m_miss_dataloader,optimizerD, optimizerG, CRITIC_ITERS=5,LAMBDA=5,opt_outf=None)
-                    z = torch.randn((BATCH_SIZE, g_hidden_dim*2)).cuda()
-                    sub_z = netM(z)
-                    m_prime_miss = generate_samples(generator, sub_z, BATCH_SIZE, GENERATED_NUM, SOS)
-                    generator.load_state_dict(torch.load('./log/gen_10_0070.t7').state_dict())
+                train_GAN_SUB(g_hidden_dim, generator, netM, optimizerM, netSubD, optimizerSubD,m_miss_dataloader, SOS, 10, BATCH_SIZE, SEQ_LEN, vocab, use_cuda=True)
+                # train_WGANGP(128,netG,netD,25, m_miss_dataloader,optimizerD, optimizerG, CRITIC_ITERS=5,LAMBDA=5,opt_outf=None)
+                z = torch.randn((BATCH_SIZE, g_hidden_dim*2)).cuda()
+                sub_z = netM(z)
+                m_prime_miss = generate_samples(generator, sub_z, BATCH_SIZE, GENERATED_NUM, SOS)
+                generator.load_state_dict(torch.load('./log/gen_10_0070.t7').state_dict())
             
 
 
@@ -297,5 +298,4 @@ def run(IR,rep,GPU_NUM,OR,Method):
 
 
 if __name__=="__main__":
-    m = ['Original', 'ROS', 'GAN', 'ImbGAN']
-    run(10,0,0,False,m[3])
+    run(10,0,0,False)
